@@ -1,11 +1,10 @@
-const bodyParser = require('body-parser');
 const express = require('express');
 const fs = require('fs');
-const ngrok = require('ngrok');
 const request = require('request');
+const bodyParser = require('body-parser');
 const {WebClient, RtmClient, CLIENT_EVENTS, RTM_EVENTS} = require('@slack/client');
 
-const config = fs.readFileSync('config.json');
+const config = JSON.parse(fs.readFileSync('config.json'));
 const token = config.token;
 const footballChannelId = config.footballChannelId;
 
@@ -23,6 +22,7 @@ class Bot {
         this.matchDay = matchDay;
     }
 
+    // TODO This might produce the wrong answer once Tuesday comes
     nextGameMs() {
         let now = new Date();
         let gameDate = new Date();
@@ -197,6 +197,12 @@ class GamePoll {
             return {headline: "Not enough players! :slightly_frowning_face:"};
         }
     }
+
+    reset() {
+        for (var user in this.poll) {
+            this.poll[user] = 'unknown';
+        }
+    }
 }
 
 var myBot;
@@ -204,10 +210,10 @@ var myPoll;
 var latestPollMessageTs;
 
 async function resetPoll() {
-    myPoll = null;
+    myPoll.reset();
     latestPollMessageTs = null;
     let nextTimeMs = await myBot.nextGameMs();
-    console.log(`myPoll restarted - next restart in ${nextTimeMs/1000} seconds`);
+    console.log(`myPoll reset - next reset in ${nextTimeMs/1000} seconds`);
     setTimeout(function () {
         resetPoll();
     }, nextTimeMs);
@@ -228,7 +234,15 @@ function sendMessage(channel, message) {
 
 rtm.on(CLIENT_EVENTS.RTM.AUTHENTICATED, function (connectData) {
     myBot = new Bot(connectData.self.id);
+
+    myPoll = new GamePoll(footballChannelId);
     resetPoll();
+    web.channels.info(footballChannelId)
+    .then(function (res) {
+        myPoll.init(res.channel.members).catch(console.error);
+    })
+    .catch(console.error);
+
     console.log(`Bot activated as ${connectData.self.id} of team ${connectData.team.id}`);
 });
 rtm.on(RTM_EVENTS.MESSAGE, async function (message) {
@@ -247,21 +261,6 @@ rtm.on(RTM_EVENTS.MESSAGE, async function (message) {
                     sendMessage(message.channel, {headline: `Sorry, I can only start a poll in <#${footballChannelId}>`});
                 } else if (!myBot.isMatchDay()) {
                     sendMessage(message.channel, {headline: "Poll not available until next Tuesday"});
-                } else if (!myPoll) {
-                    myPoll = new GamePoll(message.channel);
-                    web.channels.info(myPoll.channelId)
-                    .then(function (res) {
-                        myPoll.init(res.channel.members)
-                        .then(async function () {
-                            sendMessage(message.channel, await myPoll.pollMessage())
-                            .then(function (ts) {
-                                latestPollMessageTs = ts;
-                            })
-                            .catch(console.error);
-                        })
-                        .catch(console.error);
-                    })
-                    .catch(console.error);
                 } else {
                     if (latestPollMessageTs) {
                         web.chat.delete(latestPollMessageTs, message.channel)
@@ -279,11 +278,7 @@ rtm.on(RTM_EVENTS.MESSAGE, async function (message) {
                 break;
             case 'teams':
                 if (myBot.isMatchDay()) {
-                    if (myPoll) {
-                        sendMessage(message.channel, await myPoll.teamsMessage());
-                    } else {
-                        sendMessage(message.channel, {headline: "No poll has been started this week!"});
-                    }
+                    sendMessage(message.channel, await myPoll.teamsMessage());
                 } else {
                     sendMessage(message.channel, {headline: "Teams not available until next Tuesday"});
                 }
@@ -314,14 +309,3 @@ app.post('/slack/action', urlencodedParser, function (req, res) {
     }
 });
 app.listen(8081);
-
-ngrok.connect({
-    proto: 'http',
-    addr: 8081
-}, function (err, url) {
-    if (err) {
-        console.error(`Error loading ngrok: ${err}`);
-    } else {
-        console.log(`ngrok url: ${url}`);
-    }
-});
