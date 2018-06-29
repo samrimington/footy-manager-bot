@@ -3,15 +3,26 @@ const fs = require('fs');
 const request = require('request');
 const bodyParser = require('body-parser');
 const {WebClient, RtmClient, CLIENT_EVENTS, RTM_EVENTS} = require('@slack/client');
+const ngrok = require('ngrok');
+const shuffle = require('shuffle-array');
+
+const UNKNOWN = 0;
+const YES = 1;
+const NO = 2;
+const HOME = 0;
+const AWAY = 1;
 
 const config = JSON.parse(fs.readFileSync('config.json'));
-const token = config.token;
+const slackToken = config.slackToken;
 const footballChannelId = config.footballChannelId;
+const ngrokToken = config.ngrokToken;
+const adminUserId = config.adminUserId;
+const appId = config.appId;
 
 const app = express();
 const urlencodedParser = bodyParser.urlencoded({extended: false});
-const web = new WebClient(token);
-const rtm = new RtmClient(token, {
+const web = new WebClient(slackToken);
+const rtm = new RtmClient(slackToken, {
     dataStore: false,
     useRtmConnect: true
 });
@@ -78,16 +89,20 @@ class Bot {
 
 class GamePoll {
     constructor(channelId) {
-        this.poll = {};
         this.channelId = channelId;
-        this.__teams = null;
     }
 
-    init(members) {
+    reset(members) {
         var self = this;
         return new Promise(function (resolve, reject) {
+            self.poll = {};
+            self._teams = null;
+            shuffle(members);
             for (var i in members) {
-                self.poll[`<@${members[i]}>`] = 'unknown';
+                self.poll[`<@${members[i]}>`] = {
+                    number: i,
+                    response: YES // DEBUG: Should be UNKNOWN
+                };
             }
             if (self.poll.length <= 0) {
                 reject(false);
@@ -100,43 +115,63 @@ class GamePoll {
     change(user, response) {
         var self = this;
         return new Promise(function (resolve) {
-            let userEntry = `<@${user}>`;
-            // TODO evaluate response
-            if (userEntry in self.poll) {
-                if (!(self.poll[userEntry] == 'unknown' && response == 'no')) {
-                    self.__teams = null;
+            let userId = `<@${user}>`;
+            if (userId in self.poll) {
+                if (self.poll[userId].response != response) {
+                    if (!(self.poll[userId].response == UNKNOWN && response == NO)) {
+                        self._teams = null;
+                    }
+                    self.poll[userId].response = response;
                 }
-                self.poll[userEntry] = response;
                 resolve(true);
             } else {
-                reject(false);
+                // Add new user to poll
+                self.poll[userId] = {
+                    number: self.poll.length,
+                    response: response
+                };
+                resolve(true);
             }
         });
     }
 
     result() {
-        let result = {yes: [], no: [], unknown: []};
+        let result = [[], [], []]; // 0 - Unknown, 1 - Yes, 2 - No
         for (var user in this.poll) {
-            result[this.poll[user]].push(user);
+            result[this.poll[user].response].push(user);
         }
         return result;
     }
 
     async teams() {
-        if (this.__teams) {
-            return this.__teams;
+        if (this._teams) {
+            return this._teams;
         } else {
-            let players = await this.result().yes;
-            if (players.length >= 4) {
-                let teams = {home: [], away: []};
-                for (var i = 0; i <= Math.floor(players.length / 2); i++) {
-                    let choice = Math.floor(Math.random() * players.length);
-                    teams.away.push(players[choice]);
-                    players.splice(choice, 1);
+            let players = [];
+            let headCount = 0;
+            for (var userId in this.poll) {
+                if (this.poll[userId].response == YES) {
+                    players.splice(this.poll[userId].number, 0, userId);
+                } else {
+                    players.splice(this.poll[userId].number, 0, null);
                 }
-                teams.home = players;
-                this.__teams = teams;
-                return this.__teams;
+                headCount++;
+            }
+            if (headCount >= 4) {
+                // Allocate teams by number given (order of players array)
+                let teams = [[], []]; // 0 - Home, 1 - Away
+                for (var i in players) {
+                    if (players[i]) {
+                        let t = i % 2;
+                        if (teams[t].length > teams[t?HOME:AWAY].length) {
+                            teams[t?HOME:AWAY].push(players[i]);
+                        } else {
+                            teams[t].push(players[i]);
+                        }
+                    }
+                }
+                this._teams = teams;
+                return this._teams;
             } else {
                 return;
             }
@@ -150,7 +185,7 @@ class GamePoll {
             opts: {
                 "attachments": [
                     {
-                        "text": `:+1: Sure!    \`${result.yes.length}\`\n${result.yes}\n\n:-1: Nah    \`${result.no.length}\`\n${result.no}\n\n:question: No answer    \`${result.unknown.length}\`\n${result.unknown}`,
+                        "text": `:+1: Sure!    \`${result[YES].length}\`\n${result[YES]}\n\n:-1: Nah    \`${result[NO].length}\`\n${result[NO]}\n\n:question: No answer    \`${result[UNKNOWN].length}\`\n${result[UNKNOWN]}`,
                         "fallback": "You cannot choose an option at this time",
                         "callback_id": "weekly_game",
                         "attachment_type": "default",
@@ -159,13 +194,13 @@ class GamePoll {
                                 "name": "weekly_game_res",
                                 "text": "Sure!",
                                 "type": "button",
-                                "value": "yes"
+                                "value": YES
                             },
                             {
                                 "name": "weekly_game_res",
                                 "text": "Nah",
                                 "type": "button",
-                                "value": "no",
+                                "value": NO,
                                 "confirm": {
                                     "title": "Are you sure?",
                                     "text": "Why not, the more the merrier!",
@@ -188,19 +223,13 @@ class GamePoll {
                 opts: {
                     "attachments": [
                         {
-                            "text": `:house: Home    \`${teams.home.length}\`\n${teams.home}\n\n:car: Away    \`${teams.away.length}\`\n${teams.away}`
+                            "text": `:house: Home    \`${teams[HOME].length}\`\n${teams[HOME]}\n\n:car: Away    \`${teams[AWAY].length}\`\n${teams[AWAY]}`
                         }
                     ]
                 }
             };
         } else {
             return {headline: "Not enough players! :slightly_frowning_face:"};
-        }
-    }
-
-    reset() {
-        for (var user in this.poll) {
-            this.poll[user] = 'unknown';
         }
     }
 }
@@ -210,7 +239,11 @@ var myPoll;
 var latestPollMessageTs;
 
 async function resetPoll() {
-    myPoll.reset();
+    web.channels.info(footballChannelId)
+    .then(function (res) {
+        myPoll.reset(res.channel.members).catch(console.error);
+    })
+    .catch(console.error);
     latestPollMessageTs = null;
     let nextTimeMs = await myBot.nextGameMs();
     console.log(`myPoll reset - next reset in ${nextTimeMs/1000} seconds`);
@@ -237,11 +270,6 @@ rtm.on(CLIENT_EVENTS.RTM.AUTHENTICATED, function (connectData) {
 
     myPoll = new GamePoll(footballChannelId);
     resetPoll();
-    web.channels.info(footballChannelId)
-    .then(function (res) {
-        myPoll.init(res.channel.members).catch(console.error);
-    })
-    .catch(console.error);
 
     console.log(`Bot activated as ${connectData.self.id} of team ${connectData.team.id}`);
 });
@@ -309,3 +337,17 @@ app.post('/slack/action', urlencodedParser, function (req, res) {
     }
 });
 app.listen(8081);
+
+ngrok.connect({
+    proto: 'http',
+    addr: 8081,
+    authtoken: ngrokToken,
+    region: 'eu'
+}, function (err, url) {
+    if (err) {
+        console.error(`Error loading ngrok: ${err}`);
+    } else {
+        web.chat.postEphemeral(footballChannelId, `New Request URL: ${url}/slack/action\nGo to https:/\/api.slack.com/apps/${appId}/interactive-messages to update the Request URL`, adminUserId);
+        console.log(`New Request URL: ${url}/slack/action`);
+    }
+});
