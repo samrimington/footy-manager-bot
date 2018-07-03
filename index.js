@@ -12,7 +12,7 @@ const NO = 2;
 const HOME = 0;
 const AWAY = 1;
 
-const config = JSON.parse(fs.readFileSync('config.json'));
+const config = JSON.parse(fs.readFileSync('/srv/config.json'));
 const slackToken = config.slackToken;
 const footballChannelId = config.footballChannelId;
 const ngrokToken = config.ngrokToken;
@@ -101,7 +101,7 @@ class GamePoll {
             for (var i in members) {
                 self.poll[`<@${members[i]}>`] = {
                     number: i,
-                    response: YES // DEBUG: Should be UNKNOWN
+                    response: UNKNOWN
                 };
             }
             if (self.poll.length <= 0) {
